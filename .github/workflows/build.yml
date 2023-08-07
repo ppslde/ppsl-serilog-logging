@@ -1,0 +1,151 @@
+name: Build and deploy NuGet package - Ppsl.Serilog.Logging
+
+on:
+  pull_request:
+    types:
+      - opened
+      - closed
+    branches:
+      - main
+
+jobs:
+  version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      Major: ${{ steps.gitVersion.outputs.Major }}
+      Minor: ${{  steps.gitVersion.outputs.Minor }}
+      Patch: ${{ steps.gitVersion.outputs.Patch }}
+      PreReleaseTag: ${{ steps.gitVersion.outputs.PreReleaseTag }}
+      SemVer: ${{ steps.gitVersion.outputs.SemVer }}
+      NuGetVersionV2: ${{ steps.gitVersion.outputs.NuGetVersionV2 }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET Core SDK
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: 7.x
+    
+    - name: Install GitVersion
+      uses: gittools/actions/gitversion/setup@v0.10.2
+      with:
+        versionSpec: '5.x'
+        preferLatestVersion: true
+            
+    - name: Execute GitVersion
+      id: gitVersion
+      uses: gittools/actions/gitversion/execute@v0.10.2
+      with:
+        useConfigFile: true
+    
+  build:
+    name: Build dotnet NuGet package
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      MAJOR: ${{needs.version.outputs.Major}}
+      MINOR: ${{needs.version.outputs.Minor}}
+      PATCH: ${{needs.version.outputs.Patch}}
+      TAG: ${{needs.version.outputs.PreReleaseTag}}
+      SEMVER: ${{needs.version.outputs.SemVer}}
+      NGTVER: ${{needs.version.outputs.NuGetVersionV2}}
+
+    steps:
+    - run: echo "Calculated version $SEMVER"
+
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Setup .NET Core SDK
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: |
+          6.x
+          7.x
+
+    - name: Restore dependend NuGet packages
+      run: dotnet restore
+
+    - name: Build sources
+      run: dotnet build --no-restore --configuration Release Logging
+
+    - name: Test with dotnet
+      run: dotnet test --no-restore --configuration Release --logger trx --results-directory Logging/bin/TestResults
+
+    - name: Upload dotnet test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: dotnet-test-artifacts
+        path: Logging/bin/TestResults
+      if: ${{ always() }}
+
+    - name: Check version for minor or major increase depending on pull request source branch
+      id: checkversion
+      run: |
+        echo "Checking for pull request"
+        vtag="$SEMVER"
+
+        if [ -n "$GITHUB_HEAD_REF" ]; then
+          echo "Pull request detected"
+          if [[ "$GITHUB_HEAD_REF" == "feature"* ]]; then
+            echo "Pull request from feature branch detected"
+            vtag="$MAJOR.$(($MINOR+1)).0"
+          elif [[ "$GITHUB_HEAD_REF" == "hotfix"* ]]; then
+            echo "Pull request from hotfix branch detected"
+            vtag="$MAJOR.$MINOR.$(($PATCH+1))"
+          else
+            echo "Pull request from unknown branch detected, exiting"
+            vtag="$MAJOR.$MINOR.$(($PATCH+1))-ci"
+          fi
+          echo "Version changed from '$SEMVER' to 'vtag'"
+        else
+          echo "No pull request detected, continuing"
+        fi
+
+        echo "finalverion=$vtag" >> "$GITHUB_OUTPUT"
+
+    - name: Create the package
+      run: dotnet pack --configuration Release -p:Version=${{ steps.checkversion.outputs.finalverion }} Logging
+      
+    - name: "Publish build artifacts"
+      uses: actions/upload-artifact@v3
+      with:
+        name: dotnet-build-artifacts
+        path: Logging/bin/Release/*.nupkg
+
+    - name: Create git tag
+      run: |
+          git tag ${{ steps.checkversion.outputs.finalverion }}
+          git push origin ${{ steps.checkversion.outputs.finalverion }}
+      if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+
+  publish:
+    name: Publish dotnet NuGet package on Github Packages
+    needs: [ version, build ]
+    runs-on: ubuntu-latest
+    env:
+      SEMVER: ${{needs.version.outputs.SemVer}}
+    permissions:
+      packages: write
+
+    steps:
+      - run: echo "Calculated version $SEMVER"
+  
+      - name: Setup .NET Core SDK
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: 7.x
+      
+      - name: Download nupkg artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: "dotnet-build-artifacts"
+
+      - name: NuGet push to Github
+        run: dotnet nuget push ./*.nupkg -k ${{ secrets.GITHUB_TOKEN }} -s https://nuget.pkg.github.com/ppslde/index.json --skip-duplicate
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
